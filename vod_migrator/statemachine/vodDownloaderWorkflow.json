@@ -1,0 +1,156 @@
+{
+  "Comment": "VOD Migration tool to download VOD content from URL and store on S3",
+  "StartAt": "Get existing objects from S3 Destination",
+  "States": {
+    "Get existing objects from S3 Destination": {
+      "Type": "Task",
+      "Next": "Check if destination has previously been created",
+      "Parameters": {
+        "Bucket.$": "$.downloadAssetRequest.DestinationBucket",
+        "Prefix.$": "States.Format('{}/{}', $.downloadAssetRequest.DestinationPath, $.downloadAssetRequest.Id)",
+        "MaxKeys": 1
+      },
+      "Resource": "arn:aws:states:::aws-sdk:s3:listObjectsV2",
+      "ResultPath": "$.preexistingS3ObjectsForEndpoint"
+    },
+    "Check if destination has previously been created": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Variable": "$.preexistingS3ObjectsForEndpoint.KeyCount",
+          "NumericGreaterThan": 0,
+          "Next": "Failed to download asset as destination already contatined objects"
+        }
+      ],
+      "Default": "Initiating Asset Download Notification"
+    },
+    "Failed to download asset as destination already contatined objects": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::sns:publish",
+      "Parameters": {
+        "Message.$": "$",
+        "TopicArn": "${SNS_TOPIC}"
+      },
+      "ResultPath": null,
+      "Next": "Objects already existing in destination path"
+    },
+    "Objects already existing in destination path": {
+      "Type": "Fail",
+      "Comment": "Destination path must not exist"
+    },
+    "Initiating Asset Download Notification": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::sns:publish",
+      "Parameters": {
+        "Message": {
+          "Type": "NOTIFICATION",
+          "Message": "Initiating download of egress endpoint",
+          "EgressEndpoint.$": "$..EgressEndpoints[?(@.PackagingConfigurationId == $.EgressEndpointPackagingConfigurationId)]"
+        },
+        "TopicArn": "${SNS_TOPIC}"
+      },
+      "Next": "Download Asset",
+      "ResultPath": null
+    },
+    "Download Asset": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${VOD_DOWNLOAD_LAMBDA}",
+        "Payload": {
+          "numThreads": 20,
+          "destination_bucket.$": "$.downloadAssetRequest.DestinationBucket",
+          "destination_path.$": "States.Format('{}/{}', $.downloadAssetRequest.DestinationPath, $.downloadAssetRequest.Id)",
+          "verbose": true,
+          "source_url.$": "$.downloadAssetRequest.SourceLocation",
+          "rpsLimit": 20
+        }
+      },
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.AWSLambdaException",
+            "Lambda.SdkClientException"
+          ],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 6,
+          "BackoffRate": 2
+        }
+      ],
+      "ResultPath": "$.lambdaResponse",
+      "Next": "Check if asset successfully downloaded"
+    },
+    "Check if asset successfully downloaded": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Variable": "$.lambdaResponse.Payload.result.status",
+          "StringEquals": "COMPLETE",
+          "Next": "Download complete"
+        },
+        {
+          "Variable": "$.lambdaResponse.Payload.result.status",
+          "StringEquals": "LAMBDA_TIMEOUT",
+          "Next": "Restart lambda as it reached timeout"
+        }
+      ],
+      "Default": "Download failed"
+    },
+    "Download failed": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::sns:publish",
+      "Parameters": {
+        "TopicArn": "${SNS_TOPIC}",
+        "Message": {
+          "Type": "ERROR",
+          "Message": "Failed to download asset from source location",
+          "EgressEndpoint.$": "$..EgressEndpoints[?(@.PackagingConfigurationId == $.EgressEndpointPackagingConfigurationId)]",
+          "DebugInfo.$": "$"
+        }
+      },
+      "Next": "Failed to download asset",
+      "ResultPath": null
+    },
+    "Download complete": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::sns:publish",
+      "Parameters": {
+        "TopicArn": "${SNS_TOPIC}",
+        "Message": {
+          "Type": "NOTIFICATION",
+          "Message": "Download Complete",
+          "ProgressUpdate.$": "$.lambdaResponse.Payload.result",
+          "Asset.$": "$.lambdaResponse.Payload.asset"
+        }
+      },
+      "Next": "Asset Successfully Downloaded",
+      "ResultPath": null
+    },
+    "Asset Successfully Downloaded": {
+      "Type": "Succeed"
+    },
+    "Failed to download asset": {
+      "Type": "Fail"
+    },
+    "Restart lambda as it reached timeout": {
+      "Type": "Pass",
+      "Next": "Download progress update",
+      "ResultPath": null
+    },
+    "Download progress update": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::sns:publish",
+      "Parameters": {
+        "TopicArn": "${SNS_TOPIC}",
+        "Message": {
+          "Type": "NOTIFICATION",
+          "Message": "Restarting lambda as it reached timeout",
+          "ProgressUpdate.$": "$.lambdaResponse.Payload.result"
+        }
+      },
+      "Next": "Download Asset",
+      "ResultPath": null
+    }
+  }
+}
