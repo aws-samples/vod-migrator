@@ -131,7 +131,9 @@
       "Type": "Succeed"
     },
     "Failed to download asset": {
-      "Type": "Fail"
+      "Type": "Fail",
+      "CausePath": "$.lambdaResponse",
+      "Error": "Download failed"
     },
     "Restart lambda as it reached timeout": {
       "Type": "Pass",

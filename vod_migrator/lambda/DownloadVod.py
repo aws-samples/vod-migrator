@@ -105,7 +105,7 @@ def loadUrl(caller, url, authHeaders):
 
   while attempt < retryCount:
     (urlPayload, contentType) = loadUrlWorker(caller, url, authHeaders)
-    if urlPayload != None:
+    if urlPayload is not None:
       return (urlPayload, contentType)
     attempt += 1
     time.sleep(retryInterval)
@@ -120,7 +120,7 @@ def fetchSegments(n, baseUrl, fetchQ, s3, destBucket, destPrefix, acl, authHeade
 # it.  If no success, skips the segment and moves on to the next.
 # The fetch rate is determined by the queue fill rate.
 #
-# If the fetch succeeds, writes the segment to the specifed S3 bucket.
+# If the fetch succeeds, writes the segment to the specified S3 bucket.
 
   downloadedSegments = []
   segment = ''
@@ -135,14 +135,14 @@ def fetchSegments(n, baseUrl, fetchQ, s3, destBucket, destPrefix, acl, authHeade
       segmentBase = '/' + segmentBase.replace(baseUrl, "")
       
       t = time.time()
-      logger.debug("Attempting to download: %s" % segment)
+      logger.debug("[Thread %d] Attempting to download: %s" % (n,segment))
       (segmentData, contentType) = loadUrl('fetchSegments', segment, authHeaders)
       if segmentData == None:
-        logger.debug("No segment data downloaded")
-        logger.debug("'%s' fetch attempt failed; skipping" % segmentBase)
+        logger.debug("[Thread %d] No segment data downloaded" % n)
+        logger.debug("[Thread %d] '%s' fetch attempt failed; skipping" % (n, segmentBase))
         skippedSegments.append(segment)
       else:
-        writeBucket(s3, destBucket, destPrefix, segmentBase, segmentData, contentType, acl)
+        writeBucket(n, s3, destBucket, destPrefix, segmentBase, segmentData, contentType, acl)
         downloadedSegments.append(segment)
         # if verbose:
         #   print('Thread', n, segmentBase, contentType, '{:2.2f}'.format(time.time() - t), 's')
@@ -156,15 +156,15 @@ def fetchSegments(n, baseUrl, fetchQ, s3, destBucket, destPrefix, acl, authHeade
   }
 
 
-def writeBucket(s3, destBucket, destPrefix, objectName, content, contentType, acl):
+def writeBucket(n, s3, destBucket, destPrefix, objectName, content, contentType, acl):
 # Writes content to prefix+objectName in bucketName.  Failures are fatal.
 
  try:
-  logger.debug("DEBUG: Writing segment to: s3://%s/%s" % (destBucket, destPrefix+objectName))
+  logger.debug("[Thread %d] Writing segment to: s3://%s/%s" % (n, destBucket, destPrefix+objectName))
   s3.Bucket(destBucket).put_object(Key=destPrefix+objectName, Body=content, ContentType=contentType, ACL=acl)
  except Exception as s3Err:
-   print('Fatal:  error writing to S3')
-   print('Bucket: ', destBucket, ' Asset ID:', destPrefix, ' Object:', objectName, ' ACL:', acl)
+   logger.error("[Thread %d] Fatal:  error writing to S3" % n)
+   logger.error("[Thread %d] Bucket: " % n, destBucket, ' Asset ID:', destPrefix, ' Object:', objectName, ' ACL:', acl)
    print(s3Err)
    os._exit(3)
 
@@ -229,11 +229,11 @@ def fetchStream(event, context):
       'result': { "status": "FAILED" }
     }
   except Exception as e:
-    print(repr(e))
+    print("Caught 'Exception':" + repr(e))
     return {
       'status': 500,
       'message': "Unhandled Exception. Check logs",
-      'result': { "status": "FAILED" }
+      'result': { "status": "FAILED", "exception": repr(e) }
     }
   else:
     if vodAssetType == "UnsupportedFormat":
@@ -366,7 +366,7 @@ def queueObjectsToFetch(preExistingObjects, allResources, commonPrefix, fetchQ, 
       # to the point where they will not be processed before the lambda timeout
       # Suggest setting a max queue size (say 20). If the queue is larger then the max
       # size the process should sleep. While in this loop periodic checks will be required
-      # to take not of the LAMBDA_MIN_TIME_REMAINING_TRIGGER and break the loop if required
+      # to take note of the LAMBDA_MIN_TIME_REMAINING_TRIGGER and break the loop if required
       # to prevent a timeout
       # fetchQ.qsize()
 
@@ -386,18 +386,18 @@ def queueObjectsToFetch(preExistingObjects, allResources, commonPrefix, fetchQ, 
 def parseVodAssetManifests( assetUrl, authHeaders ):
   # Process the passed in manifest file and return a vodAsset object
   # with all the data necessary to download all the parts of the stream
-  # Returns a data structure containing the parse information and
+  # Returns a data structure containing the parsed information and
   # the type of asset
 
   parsedUrl = urlparse(assetUrl)
   vodAsset                  = None
   if parsedUrl.path.endswith('.m3u8') or "format=m3u8-aapl" in parsedUrl.path:
     vodAssetType = 'hls'
-    vodAsset = HlsVodAsset(assetUrl, authHeaders)
+    vodAsset = HlsVodAsset(logger, assetUrl, authHeaders)
 
   elif parsedUrl.path.endswith('.mpd') or "format=mpd-time-csf" in parsedUrl.path:
     vodAssetType = 'dash'
-    vodAsset = DashVodAsset(assetUrl, authHeaders)
+    vodAsset = DashVodAsset(logger, assetUrl, authHeaders)
 
   else:
     vodAssetType = 'UnsupportedFormat'

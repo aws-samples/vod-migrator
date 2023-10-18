@@ -22,8 +22,12 @@ import re
 
 http = urllib3.PoolManager()
 
+logger = None
+
 class HlsVodAsset:
-  def __init__(self, masterManifest, authHeaders=None):
+  def __init__(self, loggerParam, masterManifest, authHeaders=None):
+    global logger
+    logger = loggerParam
     self.masterManifest = masterManifest
     self.masterManifestContentType = None
     self.variantManifests   = None
@@ -31,6 +35,7 @@ class HlsVodAsset:
     self.mediaSegmentList  = []
     self.commonPrefix = None
     self.allResources = None
+    self.allResourcesExceptMasterManifest = None
     self.authHeaders = authHeaders
 
     self.parseHlsVodAsset()
@@ -41,7 +46,6 @@ class HlsVodAsset:
 
     # Retrieve Master Manifest
     (masterManifestBody, self.masterManifestContentType) = getManifest( self.masterManifest, self.authHeaders )
-    #TODO: If manifest is None, raise error
 
     # Parse Master Manifest
     self.variantManifests = parseMasterManifest( self.masterManifest, masterManifestBody )
@@ -72,6 +76,9 @@ class HlsVodAsset:
 
     self.allResources = uniqueResources
 
+    # Create list of all resources except master manifest
+    self.allResourcesExceptMasterManifest = [ resource for resource in self.allResources if resource != self.masterManifest ]    
+
     # Set common prefix
     # The common prefix must end with '/' to indicate this is a path and does not include
     # the start of the name of the files. For example, if all the resources of an asset start
@@ -95,21 +102,31 @@ def getManifest( url, authHeaders ):
   try:
     response = http.request( "GET", url, headers=authHeaders )
   except IOError as urlErr:
-    print("Exception occurred while attempting to get: %s" % url )
-    print(repr(urlErr))
+    logger.error("Exception occurred while attempting to retrieve manifest: %s" % url )
+    logger.error(repr(urlErr))
     urlPayload = None
-    raise(urlErr)
+    raise Exception({
+      "httpError": response.status,
+      "responseBody": repr(urlErr),
+      "error": "Exception occurred while attempting to retrieve manifest",
+      "url": url}
+    )
 
   if response.status != 200:
-    urlPayload = None
-    print('http error', response.status, 'fetching', url)
+    logger.error('http error:%d.  fetching: %s' % (response.status, url) )
+    raise Exception({
+      "httpError": response.status,
+      "responseBody": response.data.decode('utf-8'),
+      "error": "Error received when retrieving manifest",
+      "url": url}
+    )
   else:
     urlPayload = response.data
     contentType = response.headers['Content-Type']
     # Some packagers set the manifest type incorrectly.
     # This needs to be corrected if the content type is 'binary/octet-stream'
     if contentType == 'binary/octet-stream':
-      print("Content type was '%s', overriding to '%s'" % (contentType, 'application/x-mpegURL'))
+      logger.info("Content type was '%s', overriding to '%s'" % (contentType, 'application/x-mpegURL'))
       contentType = 'application/x-mpegURL'
 
     # Not all servers return a 'Content-Length' header. If available it is worth checking
@@ -117,15 +134,19 @@ def getManifest( url, authHeaders ):
       expectedLen = int(response.headers['Content-Length'])
       receivedLen = len(urlPayload)
       if receivedLen != expectedLen:
-        print('HlsVodAsset: ', url, 'expected', expectedLen, '; received', receivedLen)
+        logger.error('HlsVodAsset: ', url, 'expected', expectedLen, '; received', receivedLen)
         urlPayload = None
 
   if not( urlPayload is None ):
     urlPayload = urlPayload.decode('utf-8')
     # Check if it's an HLS manifest
     if urlPayload[0:7] != '#EXTM3U':
-      print('Not an HLS manifest:', url)
-      os._exit(2)
+      raise Exception({
+        "httpError": response.status,
+        "responseBody": response.data,
+        "error": "Not a HLS manifest",
+        "url": url}
+      )
 
   return ( urlPayload, contentType )
 
@@ -136,6 +157,7 @@ def parseMasterManifest( masterManifestUrl, masterManifestBody ):
 
   variantsDict = {}
   for line in masterManifestBody.splitlines():
+    logger.debug("[parseMasterManifest] Line: %s" % line)
     name = None
 
     # Parse line starting with EXT-X-MEDIA
@@ -149,39 +171,53 @@ def parseMasterManifest( masterManifestUrl, masterManifestBody ):
       for keyVal in re.split(r',\s*(?=(?:[^"]*"[^"]*")*[^"]*$)', line):
         (key, val) = keyVal.split('=', 1)
         mediaDict[key] = val.strip('"')
-      name = mediaDict['URI']
+      if mediaDict['URI']:
+        name = mediaDict['URI']
+      else:
+        # Skip lines not containing variant manifest
+        next
 
     elif line == "":
       # Skip blank lines
-      next
+      continue
 
     # Parse lines which do not start with a comment
     # e.g. ../../../bf4fc289ea7a4a9a8030bfdfb6dd8180/75449fe7ed1a49288019306701174382/index_1_0.ts
     elif line[0] != '#':
       name = line
 
+    else:
+      # Skip lines not including a variant manifest
+      continue
+
     # Add key to dict if it has not been seen before
+    logger.debug("[parseMasterManifest] Name: %s" % name)
     absoluteUrl = name
     if name and name.startswith("http"):
       absoluteUrl = name
     elif name:
       absoluteUrl = normalizeUrl("%s/%s" % (os.path.dirname(masterManifestUrl), name))
+    logger.debug("[parseMasterManifest] AbsoluteUrl: %s" % absoluteUrl)
 
     if not (absoluteUrl is None or absoluteUrl in variantsDict.keys()):
       variantsDict[absoluteUrl] = 1
-    
+
   variants = list(variantsDict.keys())
 
   return variants
 
 
 
-# Normalises url and removes additional '..' notations
+# Normalizes url and removes additional '..' notations
 def normalizeUrl( url ):
 
   o = urlparse(url)
   absPath = os.path.normpath( o.path )
   absUrl = "%s://%s%s" % (o.scheme, o.netloc, absPath)
+
+  # Include query parameter if present
+  if o.query:
+    absUrl += "?%s" % o.query
 
   return absUrl
 

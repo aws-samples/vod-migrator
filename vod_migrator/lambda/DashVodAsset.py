@@ -25,6 +25,8 @@ import re
 
 http = urllib3.PoolManager()
 
+logger = None
+
 # Supported Manifest
 # Compact Time/Number with Timeline
 # - AdaptationSet contains:
@@ -37,7 +39,9 @@ http = urllib3.PoolManager()
 #  - Each representations contains Segment Template
 
 class DashVodAsset:
-  def __init__(self, masterManifest, authHeaders=None):
+  def __init__(self, loggerParam, masterManifest, authHeaders=None):
+    global logger
+    logger = loggerParam
     self.masterManifest = masterManifest
     self.masterManifestContentType = None
     self.mediaSegmentList  = []
@@ -62,23 +66,23 @@ class DashVodAsset:
     periodCounter = 1
     for period in mpd.periods:
 
-      print("Starting processing Period %d ... " % periodCounter)
+      logger.info("Starting processing Period %d ... " % periodCounter)
       # loop over all the adaptation sets in the period
 
       adaptationSetCounter = 1
       for adaptationSet in period.adaptation_sets:
 
-        print("Starting processing AdaptationSet %d with MimeType '%s'" % (adaptationSetCounter, adaptationSet.mime_type))
+        logger.info("Starting processing AdaptationSet %d with MimeType '%s'" % (adaptationSetCounter, adaptationSet.mime_type))
 
         listOfSegments = getAdaptationSetSegmentList(mpdBaseUrl, adaptationSet, period)
         mediaSegments.extend(listOfSegments)
 
-        print("Finished processing AdaptationSet %d." % adaptationSetCounter)
+        logger.info("Finished processing AdaptationSet %d." % adaptationSetCounter)
 
         # Increment AdaptationSet Counter
         adaptationSetCounter = adaptationSetCounter + 1
 
-      print("Finished processing Period %d." % periodCounter)
+      logger.info("Finished processing Period %d." % periodCounter)
 
       # Increment Period Counter
       periodCounter = periodCounter + 1
@@ -118,21 +122,31 @@ def getManifest( url, authHeaders ):
   try:
     response = http.request( "GET", url, headers=authHeaders )
   except IOError as urlErr:
-    print("Exception occurred while attempting to get: %s" % url )
-    print(repr(urlErr))
+    logger.error("Exception occurred while attempting to retrieve manifest: %s" % url )
+    logger.info(repr(urlErr))
     urlPayload = None
-    raise(urlErr)
+    raise Exception({
+      "httpError": response.status,
+      "responseBody": repr(urlErr),
+      "error": "Exception occurred while attempting to retrieve manifest",
+      "url": url}
+    )
 
   if response.status != 200:
-    urlPayload = None
-    print('http error', response.status, 'fetching', url)
+    logger.error('http error:%d.  fetching: %s' % (response.status, url) )
+    raise Exception({
+      "httpError": response.status,
+      "responseBody": response.data.decode('utf-8'),
+      "error": "Error received when retrieving manifest",
+      "url": url}
+    )
   else:
     urlPayload = response.data
     contentType = response.headers['Content-Type']
     expectedLen = int(response.headers['Content-Length'])
     receivedLen = len(urlPayload)
     if receivedLen != expectedLen:
-      print('DashVodAsset: ', url, 'expected', expectedLen, '; received', receivedLen)
+      logger.info('DashVodAsset: ', url, 'expected', expectedLen, '; received', receivedLen)
       urlPayload = None
 
   if not( urlPayload is None ):
@@ -140,12 +154,16 @@ def getManifest( url, authHeaders ):
 
   return ( urlPayload, contentType )
 
-# Normalises url and removes additional '..' notations
-def normaliseUrl( url ):
+# Normalizes url and removes additional '..' notations
+def normalizeUrl( url ):
 
   o = urlparse(url)
   absPath = os.path.normpath( o.path )
   absUrl = "%s://%s%s" % (o.scheme, o.netloc, absPath)
+
+  # Include query parameter if present
+  if o.query:
+    absUrl += "?%s" % o.query
 
   return absUrl
 
@@ -155,7 +173,7 @@ def getAdaptationSetSegmentList(mpdBaseUrl, adaptationSet, period):
   mediaSegments = []
   
   for representation in adaptationSet.representations:
-    print("Processing Representation %s:" % representation.id)
+    logger.info("Processing Representation %s:" % representation.id)
 
     # Get segment Template
     # Segment template may be defined in representation or at the Adaptation set level
@@ -165,13 +183,15 @@ def getAdaptationSetSegmentList(mpdBaseUrl, adaptationSet, period):
     elif adaptationSet.segment_templates:
       segmentTemplates = adaptationSet.segment_templates
     else:
-      print("Unable to find Segment Template for Representation %s" % representation.id)
-      exit(1)
+      errorMessage = "Unable to find Segment Template for Representation %s" % representation.id
+      logger.error(errorMessage)
+      raise Exception({ "error": errorMessage })
 
     # Assumption there is only one segment template per adaptation set
     if len(segmentTemplates) > 1:
-      print("Unsupported DASH Manifest format. Maximum of one segment template per adaptations set")
-      exit(2)
+      errorMessage = "Unsupported DASH Manifest format. Maximum of one segment template per adaptations set"
+      logger.error(errorMessage)
+      raise Exception({ "error": errorMessage })
 
     ############################
     # Process Media Files
@@ -187,7 +207,7 @@ def getAdaptationSetSegmentList(mpdBaseUrl, adaptationSet, period):
     if "$Bandwidth$" in mediaSegmentTemplate:
       mediaSegmentTemplate = mediaSegmentTemplate.replace("$Bandwidth$", str(representation.bandwidth))
 
-    print("Media Segment Template: %s" % mediaSegmentTemplate)
+    logger.info("Media Segment Template: %s" % mediaSegmentTemplate)
 
     # Generate a list of media files to be downloaded
     # Segment Templates do not exist for some renditions (e.g. 'image/jpeg')
@@ -217,14 +237,14 @@ def getAdaptationSetSegmentList(mpdBaseUrl, adaptationSet, period):
       if "$Time$" in initSegmentTemplate:
         initSegmentTemplate = mediaSegmentTemplate.replace("$Time$", "i")
 
-      print("Init Segment Template: %s" % initSegmentTemplate)
+      logger.info("Init Segment Template: %s" % initSegmentTemplate)
       # Add init file to resource list
-      absInitSegmentTemplate = normaliseUrl(mpdBaseUrl + '/' + initSegmentTemplate)
+      absInitSegmentTemplate = normalizeUrl(mpdBaseUrl + '/' + initSegmentTemplate)
 
       # Append init files to list of media files to be downloaded
       mediaSegmentsForRepresentation.append(absInitSegmentTemplate)
     else:
-      print("Skipping init file as there is no init for '%s' representation" % representation.id)
+      logger.info("Skipping init file as there is no init for '%s' representation" % representation.id)
 
     # Append list of files to be downloaded as part of this adaptation set
     mediaSegments.extend(mediaSegmentsForRepresentation)
@@ -247,7 +267,7 @@ def getMediaSegmentList( mediaSegmentTemplate, startNumber, mediaSegmentTimes, m
       resource = resource.replace("$Number$", str(startNumber))
       startNumber = startNumber + 1
 
-    absResource = normaliseUrl(mpdBaseUrl + '/' + resource)
+    absResource = normalizeUrl(mpdBaseUrl + '/' + resource)
     mediaSegments.append(absResource)
 
   return mediaSegments
