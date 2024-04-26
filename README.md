@@ -157,7 +157,11 @@ The VOD Migrator is capable of harvesting assets from MediaPackage V2 endpoints 
 
 As part of the VOD Migrator deployment an IAM role with a name similar to "VodMigratorStack-VodDownloadLambdaRoleABCABCABC-XYZXYZXYZ" is created. This role is assumed by the AWS Lambda function responsible for downloading the assets from the endpoint. This AWS Lambda function is invoked by the Step Function State Machine. When the role is created it is assigned a policy to access all the MediaPackage channels in the account and region where the stack is deployed.
 
-**Note: The AWS Lamdba will *NOT* be able to access content from an endpoint secured with a resource-based policy unless the MediPackage V2 Endpoint Resource-based policy includes the VodDownloadLambdaRole as a Principal with permssions to 'GetObject' from the specified MediaPackage V2 endpoint**
+**Note: The AWS Lambda Function using the 'VodMigratorStack-VodDownloadLambdaRoleABCABCABC-XYZXYZXYZ' role has permission to access content from *ALL* MediaPackage V2 endpoints in the region where the lambda is deployed. These permissions may be too permissive for many deployments and should be reviewed.**
+
+To improve the security posture of the deployment it is recommended to either:
+1. Modify the IAM role to only allow access to a specific set of MediaPackage Channel Groups or Channel Endpoints; or
+2. Include an explicit deny in all MediaPackage Endpoint policies.
 
 For more information see the [Origin endpoint authorization](https://docs.aws.amazon.com/mediapackage/latest/userguide/endpoint-auth.html) section of the MediaPackage V2 documentation.
 
