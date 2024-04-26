@@ -15,17 +15,16 @@
 # SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
 import os
-import urllib3
 from pprint import pprint
 from urllib.parse import urlparse
+from Downloader import Downloader
+from logging import Logger
 import re
-
-http = urllib3.PoolManager()
 
 logger = None
 
 class HlsVodAsset:
-  def __init__(self, loggerParam, masterManifest, authHeaders=None):
+  def __init__(self, loggerParam: Logger, masterManifest: str, downloader: Downloader, authHeaders=None):
     global logger
     logger = loggerParam
     self.masterManifest = masterManifest
@@ -36,32 +35,33 @@ class HlsVodAsset:
     self.commonPrefix = None
     self.allResources = None
     self.allResourcesExceptMasterManifest = None
+    self.downloader = downloader
     self.authHeaders = authHeaders
 
     self.parseHlsVodAsset()
 
-# Function will parse variant manifest and extract a list of all media and init segments
-# media and init segments will store absolute URLs for segments in mediaSegmentList
+  # Function will parse variant manifest and extract a list of all media and init segments
+  # media and init segments will store absolute URLs for segments in mediaSegmentList
   def parseHlsVodAsset( self ):
 
     # Retrieve Master Manifest
-    (masterManifestBody, self.masterManifestContentType) = getManifest( self.masterManifest, self.authHeaders )
+    (masterManifestBody, self.masterManifestContentType) = self.__getManifest( self.masterManifest )
 
     # Parse Master Manifest
-    self.variantManifests = parseMasterManifest( self.masterManifest, masterManifestBody )
+    self.variantManifests = self.__parseMasterManifest( self.masterManifest, masterManifestBody )
 
     # For each variant manifest
     for variant in self.variantManifests:
 
       # Retrieve Variant Manifest
-      (variantManifestBody, variantContentType) = getManifest( variant, self.authHeaders )
+      (variantManifestBody, variantContentType) = self.__getManifest( variant )
       self.variantManifestsData[variant] = {
         "body": variantManifestBody,
         "contentType": variantContentType
       }
 
       # Parse Variant Manifest
-      segments = parseVariantManifest( variant, variantManifestBody )
+      segments = self.__parseVariantManifest( variant, variantManifestBody )
       self.mediaSegmentList.extend(segments)
 
     # Determine commonPrefix across all resource
@@ -95,168 +95,183 @@ class HlsVodAsset:
 
     return
 
+  # Function provides a hook to inspect and potentially modify the retrieved data for each
+  # resource prior to the resource being written to storage.
+  # In most cases this will not be required but there are certain circumstances where
+  # assets harvests from a live stream may need to be slightly modified to work optimally
+  # in a VOD context.
+  def manipulateResourceBeforeWritingToStorage( self, resource, data, contentType ):
 
-def getManifest( url, authHeaders ):
+    # extract query parameters from resource url
+    queryStrings = urlparse(resource).query
 
-  contentType = None
-  try:
-    response = http.request( "GET", url, headers=authHeaders )
-  except IOError as urlErr:
-    logger.error("Exception occurred while attempting to retrieve manifest: %s" % url )
-    logger.error(repr(urlErr))
-    urlPayload = None
-    raise Exception({
-      "httpError": response.status,
-      "responseBody": repr(urlErr),
-      "error": "Exception occurred while attempting to retrieve manifest",
-      "url": url}
-    )
+    # Check if the resource is the master manifest
+    if resource == self.masterManifest and queryStrings:
+      logger.info("Modifying multi-variant manifest to remove query parameters in references to variant manifests")
+      multiVariantManifestString = data.decode('utf-8')
+      multiVariantManifestString = multiVariantManifestString.replace( "?"+queryStrings ,"" )
+      data = str.encode(multiVariantManifestString)
 
-  if response.status != 200:
-    logger.error('http error:%d.  fetching: %s' % (response.status, url) )
-    raise Exception({
-      "httpError": response.status,
-      "responseBody": response.data.decode('utf-8'),
-      "error": "Error received when retrieving manifest",
-      "url": url}
-    )
-  else:
-    urlPayload = response.data
-    contentType = response.headers['Content-Type']
-    # Some packagers set the manifest type incorrectly.
-    # This needs to be corrected if the content type is 'binary/octet-stream'
-    if contentType == 'binary/octet-stream':
-      logger.info("Content type was '%s', overriding to '%s'" % (contentType, 'application/x-mpegURL'))
-      contentType = 'application/x-mpegURL'
+    return (data, contentType)
 
-    # Not all servers return a 'Content-Length' header. If available it is worth checking
-    if 'Content-Length' in response.headers.keys():
-      expectedLen = int(response.headers['Content-Length'])
-      receivedLen = len(urlPayload)
-      if receivedLen != expectedLen:
-        logger.error('HlsVodAsset: ', url, 'expected', expectedLen, '; received', receivedLen)
-        urlPayload = None
 
-  if not( urlPayload is None ):
-    urlPayload = urlPayload.decode('utf-8')
-    # Check if it's an HLS manifest
-    if urlPayload[0:7] != '#EXTM3U':
+  def __getManifest( self, url: str ):
+
+    contentType = None
+    try:
+      (statusCode, urlPayload, contentType, errorMessage) = self.downloader.loadUrl('hlsVodAsset', url, self.authHeaders)
+    except IOError as urlErr:
+      logger.error("Exception occurred while attempting to retrieve manifest: %s" % url )
+      logger.error(repr(urlErr))
+      urlPayload = None
       raise Exception({
-        "httpError": response.status,
-        "responseBody": response.data,
-        "error": "Not a HLS manifest",
+        "httpError": statusCode,
+        "responseBody": repr(urlErr),
+        "error": "Exception occurred while attempting to retrieve manifest",
         "url": url}
       )
 
-  return ( urlPayload, contentType )
+    if statusCode is None or statusCode != 200:
 
-
-# Function will parse master manifest and extract a list of all the variant manifests
-# Variant manifest URLs will be stored in list in 'variantManifest'
-def parseMasterManifest( masterManifestUrl, masterManifestBody ):
-
-  variantsDict = {}
-  for line in masterManifestBody.splitlines():
-    logger.debug("[parseMasterManifest] Line: %s" % line)
-    name = None
-
-    # Parse line starting with EXT-X-MEDIA
-    # e.g. EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="audio_0",CHANNELS="2",NAME="und",LANGUAGE="und",DEFAULT=YES, \
-    #      AUTOSELECT=YES,URI="bf4fc289ea7a4a9a8030bfdfb6dd8180/75449fe7ed1a492880193067011
-    if line.startswith('#EXT-X-MEDIA:') or line.startswith('#EXT-X-I-FRAME-STREAM-INF:'):
-      line = line.split(':', 1)[1]
-      mediaDict = {}
-
-      # Add EXT-X-MEDIA properties to data set 
-      for keyVal in re.split(r',\s*(?=(?:[^"]*"[^"]*")*[^"]*$)', line):
-        (key, val) = keyVal.split('=', 1)
-        mediaDict[key] = val.strip('"')
-      if mediaDict['URI']:
-        name = mediaDict['URI']
+      # Format status code
+      if statusCode is None:
+        statusCode = "None"
       else:
-        # Skip lines not containing variant manifest
-        next
+        statusCode = str(statusCode)
 
-    elif line == "":
-      # Skip blank lines
-      continue
-
-    # Parse lines which do not start with a comment
-    # e.g. ../../../bf4fc289ea7a4a9a8030bfdfb6dd8180/75449fe7ed1a49288019306701174382/index_1_0.ts
-    elif line[0] != '#':
-      name = line
+      logger.error('http error:%s.  fetching: %s' % (statusCode, url) )
+      raise Exception({
+        "httpError": statusCode,
+        "responseBody": urlPayload.decode('utf-8') if urlPayload else None,
+        "error": errorMessage if errorMessage else "Error received when retrieving manifest",
+        "url": url}
+      )
 
     else:
-      # Skip lines not including a variant manifest
-      continue
+      # Some packagers set the manifest type incorrectly.
+      # This needs to be corrected if the content type is 'binary/octet-stream'
+      if contentType == 'binary/octet-stream':
+        logger.info("Content type was '%s', overriding to '%s'" % (contentType, 'application/x-mpegURL'))
+        contentType = 'application/x-mpegURL'
 
-    # Add key to dict if it has not been seen before
-    logger.debug("[parseMasterManifest] Name: %s" % name)
-    absoluteUrl = name
-    if name and name.startswith("http"):
+    if not( urlPayload is None ):
+      urlPayload = urlPayload.decode('utf-8')
+      # Check if it's an HLS manifest
+      if urlPayload[0:7] != '#EXTM3U':
+        raise Exception({
+          "httpError": statusCode,
+          "responseBody": urlPayload,
+          "error": "Not a HLS manifest",
+          "url": url}
+        )
+
+    return ( urlPayload, contentType )
+
+
+  # Function will parse master manifest and extract a list of all the variant manifests
+  # Variant manifest URLs will be stored in list in 'variantManifest'
+  def __parseMasterManifest( self, masterManifestUrl: str, masterManifestBody: bytes ):
+
+    variantsDict = {}
+    for line in masterManifestBody.splitlines():
+      logger.debug("[parseMasterManifest] Line: %s" % line)
+      name = None
+
+      # Parse line starting with EXT-X-MEDIA
+      # e.g. EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="audio_0",CHANNELS="2",NAME="und",LANGUAGE="und",DEFAULT=YES, \
+      #      AUTOSELECT=YES,URI="bf4fc289ea7a4a9a8030bfdfb6dd8180/75449fe7ed1a492880193067011
+      if line.startswith('#EXT-X-MEDIA:') or line.startswith('#EXT-X-I-FRAME-STREAM-INF:'):
+        line = line.split(':', 1)[1]
+        mediaDict = {}
+
+        # Add EXT-X-MEDIA properties to data set 
+        for keyVal in re.split(r',\s*(?=(?:[^"]*"[^"]*")*[^"]*$)', line):
+          (key, val) = keyVal.split('=', 1)
+          mediaDict[key] = val.strip('"')
+        if mediaDict['URI']:
+          name = mediaDict['URI']
+        else:
+          # Skip lines not containing variant manifest
+          next
+
+      elif line == "":
+        # Skip blank lines
+        continue
+
+      # Parse lines which do not start with a comment
+      # e.g. ../../../bf4fc289ea7a4a9a8030bfdfb6dd8180/75449fe7ed1a49288019306701174382/index_1_0.ts
+      elif line[0] != '#':
+        name = line
+
+      else:
+        # Skip lines not including a variant manifest
+        continue
+
+      # Add key to dict if it has not been seen before
+      logger.debug("[parseMasterManifest] Name: %s" % name)
       absoluteUrl = name
-    elif name:
-      absoluteUrl = normalizeUrl("%s/%s" % (os.path.dirname(masterManifestUrl), name))
-    logger.debug("[parseMasterManifest] AbsoluteUrl: %s" % absoluteUrl)
+      if name and name.startswith("http"):
+        absoluteUrl = name
+      elif name:
+        absoluteUrl = normalizeUrl("%s/%s" % (os.path.dirname(masterManifestUrl), name))
+      logger.debug("[parseMasterManifest] AbsoluteUrl: %s" % absoluteUrl)
 
-    if not (absoluteUrl is None or absoluteUrl in variantsDict.keys()):
-      variantsDict[absoluteUrl] = 1
+      if not (absoluteUrl is None or absoluteUrl in variantsDict.keys()):
+        variantsDict[absoluteUrl] = 1
 
-  variants = list(variantsDict.keys())
+    variants = list(variantsDict.keys())
 
-  return variants
+    return variants
 
 
+  # Function will parse variant manifest and extract a list of all media and init segments
+  # media and init segments will store absolute URLs for segments in mediaSegmentList
+  def __parseVariantManifest( self, variantManifestUrl: str, variantManifestBody: bytes ):
+
+    segmentsDict = {}
+    for line in variantManifestBody.splitlines():
+      name = None
+
+      # Parse line starting with EXT-X-MEDIA
+      # e.g. #EXT-X-MAP:URI="../../../a595fd669f4349e1846efee6e27ccfa8/bba5843ebf8f41619348551669b17f47/index_video_1_init.mp4"
+      if line.startswith('#EXT-X-MAP:') or line.startswith('#EXT-X-I-FRAME-STREAM-INF:'):
+        line = line.split(':', 1)[1]
+        mediaDict = {}
+
+        # Add EXT-X-MEDIA properties to data set 
+        for keyVal in re.split(r',\s*(?=(?:[^"]*"[^"]*")*[^"]*$)', line):
+          (key, val) = keyVal.split('=', 1)
+          mediaDict[key] = val.strip('"')
+        name = mediaDict['URI']
+
+      # Parse lines which do not start with a comment
+      # e.g. ../../../bf4fc289ea7a4a9a8030bfdfb6dd8180/75449fe7ed1a49288019306701174382/index_1_0.ts
+      elif line[0] != '#':
+        name = line
+
+      # Add key to dict if it has not been seen before
+      absoluteUrl = name
+      if name and name.startswith("http"):
+        absoluteUrl = name
+      elif name:
+        absoluteUrl = normalizeUrl("%s/%s" % (os.path.dirname(variantManifestUrl), name))
+
+      if not (absoluteUrl is None or absoluteUrl in segmentsDict.keys()):
+        segmentsDict[absoluteUrl] = 1
+      
+    segments = list(segmentsDict.keys())
+
+    return segments
 
 # Normalizes url and removes additional '..' notations
-def normalizeUrl( url ):
+def normalizeUrl( url: str ):
 
-  o = urlparse(url)
-  absPath = os.path.normpath( o.path )
-  absUrl = "%s://%s%s" % (o.scheme, o.netloc, absPath)
+  parsedUrl = urlparse(url)
+  absPath = os.path.normpath( parsedUrl.path )
+  absUrl = "%s://%s%s" % (parsedUrl.scheme, parsedUrl.netloc, absPath)
 
   # Include query parameter if present
-  if o.query:
-    absUrl += "?%s" % o.query
+  if parsedUrl.query:
+    absUrl += "?%s" % parsedUrl.query
 
   return absUrl
-
-
-# Function will parse variant manifest and extract a list of all media and init segments
-# media and init segments will store absolute URLs for segments in mediaSegmentList
-def parseVariantManifest( variantManifestUrl, variantManifestBody ):
-
-  segmentsDict = {}
-  for line in variantManifestBody.splitlines():
-    name = None
-
-    # Parse line starting with EXT-X-MEDIA
-    # e.g. #EXT-X-MAP:URI="../../../a595fd669f4349e1846efee6e27ccfa8/bba5843ebf8f41619348551669b17f47/index_video_1_init.mp4"
-    if line.startswith('#EXT-X-MAP:') or line.startswith('#EXT-X-I-FRAME-STREAM-INF:'):
-      line = line.split(':', 1)[1]
-      mediaDict = {}
-
-      # Add EXT-X-MEDIA properties to data set 
-      for keyVal in re.split(r',\s*(?=(?:[^"]*"[^"]*")*[^"]*$)', line):
-        (key, val) = keyVal.split('=', 1)
-        mediaDict[key] = val.strip('"')
-      name = mediaDict['URI']
-
-    # Parse lines which do not start with a comment
-    # e.g. ../../../bf4fc289ea7a4a9a8030bfdfb6dd8180/75449fe7ed1a49288019306701174382/index_1_0.ts
-    elif line[0] != '#':
-      name = line
-
-    # Add key to dict if it has not been seen before
-    absoluteUrl = name
-    if name and name.startswith("http"):
-      absoluteUrl = name
-    elif name:
-      absoluteUrl = normalizeUrl("%s/%s" % (os.path.dirname(variantManifestUrl), name))
-
-    if not (absoluteUrl is None or absoluteUrl in segmentsDict.keys()):
-      segmentsDict[absoluteUrl] = 1
-    
-  segments = list(segmentsDict.keys())
-
-  return segments

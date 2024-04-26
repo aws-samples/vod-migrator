@@ -27,7 +27,6 @@
 
 import os
 import time
-import urllib3
 import concurrent.futures
 import queue
 import boto3
@@ -36,6 +35,7 @@ from pprint import pprint
 from urllib.parse import urlparse
 from HlsVodAsset import HlsVodAsset
 from DashVodAsset import DashVodAsset
+from Downloader import Downloader
 import logging
 
 logger = logging.getLogger()
@@ -54,7 +54,6 @@ logging.getLogger('urllib3').setLevel(logging.INFO)
 LAMBDA_MIN_TIME_REMAINING_TRIGGER = 1 * 120 * 1000 # ms
 MAX_NUMBER_THREAD = 20
 
-poolManager = None
 s3 = boto3.resource('s3')
 
 #TODO: Progress update
@@ -62,58 +61,7 @@ s3 = boto3.resource('s3')
 #TODO: Potentially send SNS before any fatal exit (this could provide a more human readable error)
 
 
-def loadUrlWorker(caller, url, authHeaders):
-
-  try:
-    response = poolManager.request( "GET", url, headers=authHeaders )
-  except IOError as urlErr:
-    urlPayload = None
-    print('I/O error fetching', url)
-    print(urlErr)
-    return (urlPayload, None)
-
-# Here if urlopen succeeded.  Check http result code.  Anything other than
-# 200 (success) is returned to caller as an error.
-
-  if response.status != 200:
-    logger.info("Failed to download '%s'" % url)
-    urlPayload = None
-    contentType = None
-    print('http error', response.status, 'fetching', url)
-  else:
-
-# Get the payload.
-    urlPayload = response.data
-    receivedLen = len(urlPayload)
-    contentType = response.headers['Content-Type']
-
-    # Not all servers return a 'Content-Length' header. If available it is worth checking
-    if 'Content-Length' in response.headers.keys():
-      expectedLen = int(response.headers['Content-Length'])
-      if receivedLen != expectedLen:
-        print(caller+':', url, 'expected', expectedLen, '; received', receivedLen)
-        urlPayload = None
-        contentType = None
-
-  return (urlPayload, contentType)
-
-def loadUrl(caller, url, authHeaders):
-
-  retryCount = 3
-  retryInterval = 2
-  attempt = 0
-
-  while attempt < retryCount:
-    (urlPayload, contentType) = loadUrlWorker(caller, url, authHeaders)
-    if urlPayload is not None:
-      return (urlPayload, contentType)
-    attempt += 1
-    time.sleep(retryInterval)
-
-  print(caller, 'failed to load after', attempt, 'attempts: ', url)
-  return (None, None)
-
-def fetchSegments(n, baseUrl, fetchQ, s3, destBucket, destPrefix, acl, authHeaders):
+def fetchSegments(n, vodAsset, baseUrl, fetchQ, s3, destBucket, destPrefix, acl, downloader, authHeaders):
 # This is the function invoked for each thread created.
 
 # Reads a segment name from the queue, and calls loadUrl to fetch
@@ -136,12 +84,16 @@ def fetchSegments(n, baseUrl, fetchQ, s3, destBucket, destPrefix, acl, authHeade
       
       t = time.time()
       logger.debug("[Thread %d] Attempting to download: %s" % (n,segment))
-      (segmentData, contentType) = loadUrl('fetchSegments', segment, authHeaders)
+      (statusCode, segmentData, contentType, errorMessage) = downloader.loadUrl('fetchSegments', segment, authHeaders)
       if segmentData == None:
         logger.debug("[Thread %d] No segment data downloaded" % n)
         logger.debug("[Thread %d] '%s' fetch attempt failed; skipping" % (n, segmentBase))
         skippedSegments.append(segment)
       else:
+
+        # call Vod Asset to check if the resource needs to be manipulated prior to writing to storage
+        ( segmentData, contentType ) = vodAsset.manipulateResourceBeforeWritingToStorage( segment, segmentData, contentType)
+
         writeBucket(n, s3, destBucket, destPrefix, segmentBase, segmentData, contentType, acl)
         downloadedSegments.append(segment)
         # if verbose:
@@ -208,20 +160,19 @@ def fetchStream(event, context):
   if 'numThreads' in event.keys():
     numThreads = event['numThreads']
 
+  # Create downloader to manage the download of resources
+  downloader = Downloader(logger, numThreads)
+
   # Parse passed in Auth Header
   authHeaders = None
   if packaging_group_auth_header:
     authHeaders = parseAuthHeaders(packaging_group_auth_header)
 
-  # Initialize urllib3 Pool Manager
-  global poolManager
-  poolManager = urllib3.PoolManager( maxsize=numThreads )
-
   # Parse origin asset manifests
   vodAsset = None
   vodAssetType = None
   try:
-    ( vodAsset, vodAssetType ) = parseVodAssetManifests( masterManifestUrl, authHeaders )
+    ( vodAsset, vodAssetType ) = parseVodAssetManifests( masterManifestUrl, downloader, authHeaders )
   except IOError as urlErr:
     return {
       'status': 500,
@@ -266,7 +217,7 @@ def fetchStream(event, context):
     # Start the load operations and mark each future with its thread number
     logger.info('Starting %d threads' % numThreads)
     threadNumbers = list(range(1, numThreads+1))
-    threads = {executor.submit(fetchSegments, n, vodAsset.commonPrefix, fetchQ, s3, destBucket, destPath, acl, authHeaders): n for n in threadNumbers}
+    threads = {executor.submit(fetchSegments, n, vodAsset, vodAsset.commonPrefix, fetchQ, s3, destBucket, destPath, acl, downloader, authHeaders): n for n in threadNumbers}
 
     ( stopBeforeTimeout, numberQueuedObjects ) = queueObjectsToFetch(preExistingObjects, vodAsset.allResources, vodAsset.commonPrefix, fetchQ, rpsLimit, context)
 
@@ -334,7 +285,7 @@ def fetchStream(event, context):
 
 def getMasterManifestLocation(vodAsset, destBucket, destPath):
   # Determine the location of the master manifest for the asset
-  masterManifest = vodAsset.masterManifest
+  masterManifest = vodAsset.masterManifest.split('?')[0]
   s3Prefix = "s3://%s/%s/" % (destBucket, destPath)
   s3MasterManifest = masterManifest.replace( vodAsset.commonPrefix, s3Prefix )
   return s3MasterManifest
@@ -383,7 +334,7 @@ def queueObjectsToFetch(preExistingObjects, allResources, commonPrefix, fetchQ, 
   return (stopBeforeTimeout, numQueuedObject)
 
 
-def parseVodAssetManifests( assetUrl, authHeaders ):
+def parseVodAssetManifests( assetUrl, downloader, authHeaders ):
   # Process the passed in manifest file and return a vodAsset object
   # with all the data necessary to download all the parts of the stream
   # Returns a data structure containing the parsed information and
@@ -393,11 +344,11 @@ def parseVodAssetManifests( assetUrl, authHeaders ):
   vodAsset                  = None
   if parsedUrl.path.endswith('.m3u8') or "format=m3u8-aapl" in parsedUrl.path:
     vodAssetType = 'hls'
-    vodAsset = HlsVodAsset(logger, assetUrl, authHeaders)
+    vodAsset = HlsVodAsset(logger, assetUrl, downloader, authHeaders)
 
   elif parsedUrl.path.endswith('.mpd') or "format=mpd-time-csf" in parsedUrl.path:
     vodAssetType = 'dash'
-    vodAsset = DashVodAsset(logger, assetUrl, authHeaders)
+    vodAsset = DashVodAsset(logger, assetUrl, downloader, authHeaders)
 
   else:
     vodAssetType = 'UnsupportedFormat'
@@ -429,7 +380,7 @@ def listObjectsAtDestination( s3Resource, destBucket, destPath ):
 
 def parseAuthHeaders( input ):
   logger.info("Parsing Auth Headers:")
-  pprint(input)
+
   authHeaders = None
   try:
     authHeaders = json.loads(input)

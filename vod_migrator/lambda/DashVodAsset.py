@@ -16,14 +16,12 @@
 
 from mpegdash.parser import MPEGDASHParser
 import os
-import urllib3
 from isodate import parse_duration
 from datetime import datetime
-from pprint import pprint
 from urllib.parse import urlparse
+from Downloader import Downloader
+from logging import Logger
 import re
-
-http = urllib3.PoolManager()
 
 logger = None
 
@@ -39,7 +37,7 @@ logger = None
 #  - Each representations contains Segment Template
 
 class DashVodAsset:
-  def __init__(self, loggerParam, masterManifest, authHeaders=None):
+  def __init__(self, loggerParam: Logger, masterManifest: str, downloader: Downloader, authHeaders=None):
     global logger
     logger = loggerParam
     self.masterManifest = masterManifest
@@ -47,6 +45,7 @@ class DashVodAsset:
     self.mediaSegmentList  = []
     self.commonPrefix = None
     self.allResource = None
+    self.downloader = downloader
     self.authHeaders = authHeaders
 
     self.parseDashVodAsset()
@@ -58,7 +57,7 @@ class DashVodAsset:
     mediaSegments = []
 
     # Retrieve Manifest
-    (masterManifestBody, self.masterManifestContentType) = getManifest( self.masterManifest, self.authHeaders )
+    (masterManifestBody, self.masterManifestContentType) = self.__getManifest( self.masterManifest )
     mpd = MPEGDASHParser.parse(masterManifestBody)
     mpdBaseUrl = os.path.dirname(self.masterManifest)
 
@@ -116,56 +115,50 @@ class DashVodAsset:
 
     return
 
-def getManifest( url, authHeaders ):
+  # Function provides a hook to inspect and potentially modify the retrieved data for each
+  # resource prior to the resource being written to storage.
+  # In most cases this will not be required but there are certain circumstances where
+  # assets harvests from a live stream may need to be slightly modified to work optimally
+  # in a VOD context.
+  def manipulateResourceBeforeWritingToStorage( self, resource, data, contentType ):
+    return (data, contentType)
 
-  contentType = None
-  try:
-    response = http.request( "GET", url, headers=authHeaders )
-  except IOError as urlErr:
-    logger.error("Exception occurred while attempting to retrieve manifest: %s" % url )
-    logger.info(repr(urlErr))
-    urlPayload = None
-    raise Exception({
-      "httpError": response.status,
-      "responseBody": repr(urlErr),
-      "error": "Exception occurred while attempting to retrieve manifest",
-      "url": url}
-    )
+  def __getManifest( self, url: str):
 
-  if response.status != 200:
-    logger.error('http error:%d.  fetching: %s' % (response.status, url) )
-    raise Exception({
-      "httpError": response.status,
-      "responseBody": response.data.decode('utf-8'),
-      "error": "Error received when retrieving manifest",
-      "url": url}
-    )
-  else:
-    urlPayload = response.data
-    contentType = response.headers['Content-Type']
-    expectedLen = int(response.headers['Content-Length'])
-    receivedLen = len(urlPayload)
-    if receivedLen != expectedLen:
-      logger.info('DashVodAsset: ', url, 'expected', expectedLen, '; received', receivedLen)
+    contentType = None
+    try:
+      (statusCode, urlPayload, contentType, errorMessage) = self.downloader.loadUrl('dashVodAsset', url, self.authHeaders)
+    except IOError as urlErr:
+      logger.error("Exception occurred while attempting to retrieve manifest: %s" % url )
+      logger.info(repr(urlErr))
       urlPayload = None
+      raise Exception({
+        "httpError": statusCode,
+        "responseBody": repr(urlErr),
+        "error": "Exception occurred while attempting to retrieve manifest",
+        "url": url}
+      )
 
-  if not( urlPayload is None ):
-    urlPayload = urlPayload.decode('utf-8')
+    if statusCode is None or statusCode != 200:
 
-  return ( urlPayload, contentType )
+      # Format status code
+      if statusCode is None:
+        statusCode = "None"
+      else:
+        statusCode = str(statusCode)
 
-# Normalizes url and removes additional '..' notations
-def normalizeUrl( url ):
+      logger.error('http error:%s.  fetching: %s' % (statusCode, url) )
+      raise Exception({
+        "httpError": statusCode,
+        "responseBody": urlPayload.decode('utf-8') if urlPayload else None,
+        "error": errorMessage if errorMessage else "Error received when retrieving manifest",
+        "url": url}
+      )
 
-  o = urlparse(url)
-  absPath = os.path.normpath( o.path )
-  absUrl = "%s://%s%s" % (o.scheme, o.netloc, absPath)
+    if not( urlPayload is None ):
+      urlPayload = urlPayload.decode('utf-8')
 
-  # Include query parameter if present
-  if o.query:
-    absUrl += "?%s" % o.query
-
-  return absUrl
+    return ( urlPayload, contentType )
 
 
 def getAdaptationSetSegmentList(mpdBaseUrl, adaptationSet, period):
@@ -273,7 +266,7 @@ def getMediaSegmentList( mediaSegmentTemplate, startNumber, mediaSegmentTimes, m
   return mediaSegments
 
 # Uses the segment template to generate a list of segment times
-def getSegmentTimeline( segmentTemplate ):
+def getSegmentTimeline( segmentTemplate: str ):
 
   segmentTimelines = segmentTemplate.segment_timelines
 
@@ -327,3 +320,16 @@ def getInferredSegmentTimeline( startNumber, timescale, segmentTemplateDuration,
   segmentTimelineNumbers = list(range(startNumber, startNumber+numberSegments))
 
   return segmentTimelineNumbers
+
+# Normalizes url and removes additional '..' notations
+def normalizeUrl( url: str ):
+
+  parsedUrl = urlparse(url)
+  absPath = os.path.normpath( parsedUrl.path )
+  absUrl = "%s://%s%s" % (parsedUrl.scheme, parsedUrl.netloc, absPath)
+
+  # Include query parameter if present
+  if parsedUrl.query:
+    absUrl += "?%s" % parsedUrl.query
+
+  return absUrl
