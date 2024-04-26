@@ -66,8 +66,8 @@ Once the virtualenv is activated, you can install the required dependencies for 
 
 ```
 pip install --upgrade pip
-pip install -r requirements.txt   
-pip install -r vod_migrator/layer/requirements.txt  -t vod_migrator/layer/python  
+pip install -r requirements.txt
+pip install -r vod_migrator/layer/requirements.txt  -t vod_migrator/layer/python
 ```
 
 At this point you can now synthesize the CloudFormation template for this code.
@@ -105,13 +105,13 @@ export AWS_DEFAULT_REGION=us-west-2
 
 ## Step Function Execution Format
 
-Below is an example of an execution - replace the `SourceLocation` as the streaming URL to download, `SourceLocation` as S3 bucket name, `DestinationPath` as prefix (equivalent to sub folder):
+Below is an example of an execution - replace the `SourceLocation` as the streaming URL to download, `DestinationBucket` as S3 bucket name, `DestinationPath` as prefix (equivalent to sub folder):
 ```
 {
   "downloadAssetRequest": {
-    "Id": "MyAssetId",  
-    "SourceLocation": "https://example.com/asset1/asset1.m3u8",    
-    "SourceLocation": "<BUCKET_NAME>",                          
+    "Id": "MyAssetId",
+    "SourceLocation": "https://example.com/asset1/asset1.m3u8",
+    "DestinationBucket": "<BUCKET_NAME>",
     "DestinationPath": "vod-downloads"                             
   }
 }
@@ -151,6 +151,17 @@ To start an execution via the console:
 1. Select 'Start Execution' in the top right hand corner of the console
 1. Enter execution input into the input field and click 'Start Execution'
 
+# Harvesting Video On Demand Assets From MediaPackage V2 Endpoints
+
+The VOD Migrator is capable of harvesting assets from MediaPackage V2 endpoints and storing the content on S3. In many cases MediaPackage V2 endpoints will be secured using a resource-based policy. This is covered in detail in the [Security section of the AWS Elemental MediaPackage V2 documentation](https://docs.aws.amazon.com/mediapackage/latest/userguide/security-iam.html).
+
+As part of the VOD Migrator deployment an IAM role with a name similar to "VodMigratorStack-VodDownloadLambdaRoleABCABCABC-XYZXYZXYZ" is created. This role is assumed by the AWS Lambda function responsible for downloading the assets from the endpoint. This AWS Lambda function is invoked by the Step Function State Machine. When the role is created it is assigned a policy to access all the MediaPackage channels in the account and region where the stack is deployed.
+
+**Note: The AWS Lamdba will *NOT* be able to access content from an endpoint secured with a resource-based policy unless the MediPackage V2 Endpoint Resource-based policy includes the VodDownloadLambdaRole as a Principal with permssions to 'GetObject' from the specified MediaPackage V2 endpoint**
+
+For more information see the [Origin endpoint authorization](https://docs.aws.amazon.com/mediapackage/latest/userguide/endpoint-auth.html) section of the MediaPackage V2 documentation.
+
+
 # Using DownloadVod.py as a command line utility
 
 On occasion users may want to run DownloadVod.py as a command line utility (or even from CloudShell) from their local machine.
@@ -174,6 +185,7 @@ To remove the project try the following command from the local project folder, o
 
 # Known Limitations
 1. The VOD Migrator does not currently work with DASH content where a BaseUrl is specified in the manifest file.
+2. The VOD Migrator does not currently support the harvesting on Multi-period DASH assets.
 
 ## Security
 

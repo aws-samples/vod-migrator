@@ -34,6 +34,7 @@ from pathlib import Path
 import random
 import string
 from cdk_nag import ( AwsSolutionsChecks, NagSuppressions )
+import secrets
 
 class VodMigratorStack(Stack):
 
@@ -77,7 +78,7 @@ class VodMigratorStack(Stack):
                                                 description="Lambda layer containing VOD Download modules",
                                                 code=lambda_.Code.from_asset("vod_migrator/layer"),
                                                 compatible_architectures=[lambda_.Architecture.X86_64, lambda_.Architecture.ARM_64],
-                                                compatible_runtimes=[lambda_.Runtime.PYTHON_3_11]
+                                                compatible_runtimes=[lambda_.Runtime.PYTHON_3_12]
                                             )
 
         # Create Lambda Function to download VODs
@@ -86,7 +87,7 @@ class VodMigratorStack(Stack):
                                             function_name=vodDownloadLambdaFunctionName,
                                             description="Lambda function to download VOD Assets.",
                                             code=lambda_.Code.from_asset("vod_migrator/lambda"),
-                                            runtime=lambda_.Runtime.PYTHON_3_11,
+                                            runtime=lambda_.Runtime.PYTHON_3_12,
                                             handler="DownloadVod.fetchStream",
                                             role=vodDownloadLambdaRole,
                                             layers=[ vodDownloadLayer ],
@@ -130,8 +131,6 @@ class VodMigratorStack(Stack):
             #     level="ALL"
             # )
         )
-        cfn_state_machine.add_depends_on(stepFunctionRole.node.default_child)
-        cfn_state_machine.add_depends_on(stepFunctionPolicy.node.default_child)
 
         CfnOutput(self, "StateMachineArn", value=cfn_state_machine.attr_arn)
 
@@ -194,6 +193,15 @@ class VodMigratorStack(Stack):
                 "arn:aws:kms:%s:%s:key/%s" % (self.region, self.account, masterKmsKey.key_id)
             ]
         ))
+        # Download Lambda needs to be able to pull content from secure MediaPackage V2 endpoints
+        # Note: This policy will entitle the vod migrator to download content from any MediaPacakge V2
+        # channel in the account.
+        vodDownloadLambdaRole.add_to_policy(iam.PolicyStatement(
+            actions=["mediapackagev2:GetObject"],
+            resources=[
+                "arn:aws:mediapackagev2:%s:%s:channelGroup/*" % (self.region, self.account)
+            ]
+        ))
 
         return vodDownloadLambdaRole
     
@@ -235,7 +243,7 @@ class VodMigratorStack(Stack):
                         "arn:aws:kms:%s:%s:key/%s" % (self.region, self.account, masterKmsKey.key_id)
                     ]
                 ),
-                # Commented out below permissions as logging on step functios on works if permissions are
+                # Commented out below permissions as logging on step functions only works if permissions are
                 # given to all resources (i.e. '*'). Such permissions are too permissive for a sample
                 # project. When this issue is resolve code can be uncommented.
                 # # Allow state machine to log to CloudWatch
@@ -266,5 +274,5 @@ class VodMigratorStack(Stack):
 
 
 def generateRandomString(length):
-    character_set = string.ascii_letters
-    return ''.join(random.choice(character_set) for i in range(length))
+    character_set = string.ascii_letters + string.digits
+    return ''.join(secrets.choice(character_set) for i in range(length))
